@@ -115,7 +115,8 @@ export class RPSPI extends BasePeripheral implements Peripheral {
     if (this.txFIFO.full) {
       this.rp2040.dma.clearDREQ(this.dreq.tx);
     } else {
-      this.rp2040.dma.setDREQ(this.dreq.tx);
+      // bulk transfer resets dreq on its own
+      this.rp2040.dma.warmDREQ(this.dreq.tx);
     }
   }
 
@@ -123,7 +124,8 @@ export class RPSPI extends BasePeripheral implements Peripheral {
     if (this.rxFIFO.empty) {
       this.rp2040.dma.clearDREQ(this.dreq.rx);
     } else {
-      this.rp2040.dma.setDREQ(this.dreq.rx);
+      // this.rp2040.dma.setDREQ(this.dreq.rx);
+      this.rp2040.dma.singleTransfer(this.dreq.rx);
     }
   }
 

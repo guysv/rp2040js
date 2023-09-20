@@ -138,15 +138,65 @@ export class RPDMAChannel {
     this.reset();
   }
 
-  start() {
-    if (!(this.ctrl & EN) || this.ctrl & BUSY) {
-      return;
-    }
+  prepare() {
     this.ctrl |= BUSY;
     this.transCount = this.transCountReload;
+  }
+
+  start(prepared = false) {
+    if (!prepared) {
+      if (!(this.ctrl & EN) || this.ctrl & BUSY) {
+        return;
+      }
+      this.prepare()
+    }
     if (this.transCount) {
       this.scheduleTransfer();
     }
+  }
+
+  completeTransfer() {
+    this.ctrl &= ~BUSY;
+    if (!(this.ctrl & IRQ_QUIET)) {
+      this.dma.intRaw |= 1 << this.index;
+      this.dma.checkInterrupts();
+    }
+    if (this.chainTo !== this.index) {
+      this.dma.channels[this.chainTo]?.start();
+    }
+
+  }
+
+  singleTransfer() {
+    if (this.transferTimer != null) {
+      return;
+    }
+
+    this.transferFn()
+    this.updateBufferAddresses();
+    this.transCount--
+
+    if (this.transCount === 0) {
+      this.completeTransfer()
+    }
+  }
+
+  bulkTransfer() {
+    if (this.transferTimer != null) {
+      return;
+    }
+    this.transCount = this.transCountReload;
+    while (this.transCount > 0) {
+      this.transferFn();
+      this.updateBufferAddresses();
+      this.transCount--
+    }
+
+    this.completeTransfer()
+  }
+
+  startBulk() {
+    this.transferTimer = this.rp2040.clock.createTimer(0, this.bulkTransfer);
   }
 
   get treq() {
@@ -190,10 +240,8 @@ export class RPDMAChannel {
     );
   };
 
-  transfer = () => {
+  updateBufferAddresses = () => {
     const { ctrl, dataSize, ringMask } = this;
-    this.transferTimer = null;
-    this.transferFn();
     if (ctrl & INCR_READ) {
       if (ringMask && !(ctrl & RING_SEL)) {
         this.readAddr = (this.readAddr & ~ringMask) | ((this.readAddr + dataSize) & ringMask);
@@ -208,18 +256,17 @@ export class RPDMAChannel {
         this.writeAddr += dataSize;
       }
     }
+  }
+
+  transfer = () => {
+    this.transferTimer = null;
+    this.transferFn();
+    this.updateBufferAddresses();
     this.transCount--;
     if (this.transCount > 0) {
       this.scheduleTransfer();
     } else {
-      this.ctrl &= ~BUSY;
-      if (!(this.ctrl & IRQ_QUIET)) {
-        this.dma.intRaw |= 1 << this.index;
-        this.dma.checkInterrupts();
-      }
-      if (this.chainTo !== this.index) {
-        this.dma.channels[this.chainTo]?.start();
-      }
+      this.completeTransfer();
     }
   };
 
@@ -381,6 +428,11 @@ export class RPDMA extends BasePeripheral implements Peripheral {
     new RPDMAChannel(this, this.rp2040, 11),
   ];
 
+  readonly fastdreq = [
+    DREQChannel.DREQ_SPI0_TX,
+    DREQChannel.DREQ_SPI1_TX,
+  ]
+
   intRaw = 0;
   private intEnable0 = 0;
   private intForce0 = 0;
@@ -479,7 +531,16 @@ export class RPDMA extends BasePeripheral implements Peripheral {
       case MULTI_CHAN_TRIGGER:
         for (const chan of this.channels) {
           if (value & (1 << chan.index)) {
-            chan.start();
+            chan.prepare()
+          }
+        }
+        for (const chan of this.channels) {
+          if (value & (1 << chan.index)) {
+            if (this.fastdreq.includes(chan.treq)) {
+              chan.bulkTransfer();
+            } else {
+              chan.start(true)
+            }
           }
         }
         return;
@@ -495,6 +556,22 @@ export class RPDMA extends BasePeripheral implements Peripheral {
     }
   }
 
+  singleTransfer(dreqChannel: DREQChannel) {
+    const { dreq } = this;
+    if (!dreq[dreqChannel]) {
+      dreq[dreqChannel] = true;
+      for (const channel of this.channels) {
+        if (channel.treq === dreqChannel && channel.active) {
+          channel.singleTransfer();
+        }
+      }
+    }
+  }
+
+  warmDREQ(dreqChannel: DREQChannel) {
+    this.dreq[dreqChannel] = true;
+  }
+
   setDREQ(dreqChannel: DREQChannel) {
     const { dreq } = this;
     if (!dreq[dreqChannel]) {
@@ -505,7 +582,7 @@ export class RPDMA extends BasePeripheral implements Peripheral {
         }
       }
     }
-  }
+  }                               
 
   clearDREQ(dreqChannel: DREQChannel) {
     this.dreq[dreqChannel] = false;
